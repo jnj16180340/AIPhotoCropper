@@ -45,6 +45,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
+from os import getenv
 
 import numpy as np
 import tifffile
@@ -57,7 +58,7 @@ from PIL import Image, ImageDraw
 
 # using Lemonade Studio
 LMSTUDIO_BASE_URL = "http://localhost:13305/v1"
-LMSTUDIO_API_KEY = "lmstudio"
+LMSTUDIO_API_KEY = getenv('LMSTUDIO_API_KEY') or "lmstudio"
 #DEFAULT_MODEL = "qwen3-vl-8b-instruct"
 DEFAULT_MODEL = "Qwen3.6-35B-A3B-GGUF"
 QWEN_COORD_SIZE = 1000          # model reports boxes in 1000×1000 space
