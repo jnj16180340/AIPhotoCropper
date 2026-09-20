@@ -55,9 +55,11 @@ from PIL import Image, ImageDraw
 # Configuration
 # ---------------------------------------------------------------------------
 
-LMSTUDIO_BASE_URL = "http://localhost:1234/v1"
-LMSTUDIO_API_KEY = "lm-studio"
-DEFAULT_MODEL = "qwen3-vl-8b-instruct"
+# using Lemonade Studio
+LMSTUDIO_BASE_URL = "http://localhost:13305/v1"
+LMSTUDIO_API_KEY = "lmstudio"
+#DEFAULT_MODEL = "qwen3-vl-8b-instruct"
+DEFAULT_MODEL = "Qwen3.6-35B-A3B-GGUF"
 QWEN_COORD_SIZE = 1000          # model reports boxes in 1000×1000 space
 PREVIEW_MAX_PX = 1000           # longest side of the generated PNG preview
 DEFAULT_RETRIES = 2
