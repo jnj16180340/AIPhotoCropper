@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Automated photo cropping using LMStudio API (qwen3-vl model).
+Automated photo cropping using a local vision-language model.
 
 Pipeline:
   1. Downsample source image → 8-bit PNG preview for the LLM
-  2. Send PNG to qwen3-vl via LMStudio (OpenAI-compatible) API
+  2. Send PNG to a Qwen3-VL model over an OpenAI-compatible API
   3. Model reports a bounding box in 1000×1000 coordinate space
   4. Rescale bounding box to original image pixel dimensions
   5. Crop original image (preserving bit depth) → save to configured destination
@@ -12,26 +12,35 @@ Pipeline:
 Supported input formats: TIFF (.tif/.tiff), PNG (.png), JPEG (.jpg/.jpeg)
 
 Output destination modes (mutually exclusive):
-  default          write to --output-dir (default: ./output/)
+  default          write to --output-dir (default: <input-dir>/output/), mirroring
+                   each source's path relative to --input-dir
   --suffix _crop   write alongside source as filename_crop.ext
   --in-place       overwrite source (backs up to filename.orig.ext unless --no-backup)
 
 Usage:
-  python crop.py                              # all images in current dir
-  python crop.py scans/ '*.tif'              # dir or glob
-  python crop.py --in-place *.tif            # overwrite originals (backed up)
-  python crop.py --suffix _crop *.tif        # write alongside source
-  python crop.py --padding 20                # expand crop by 20 px each side
-  python crop.py --output-format jpg         # save crops as JPEG
-  python crop.py --bbox-only                 # print bboxes only, write nothing
-  python crop.py --from-log                  # re-apply crops from log (no API call)
-  python crop.py --workers 4                 # parallel processing
-  python crop.py --prompt my_prompt.txt      # custom prompt file
-  python crop.py --preview-only              # generate previews only
-  python crop.py --dry-run                   # previews + no crop/API call
+  uv run crop.py                             # all images in --input-dir (default: .)
+  uv run crop.py scans/ '*.tif'              # dir or glob
+  uv run crop.py --input-dir scans/ --output-dir ~/crops
+  uv run crop.py --input-dir scans/ -r        # recurse, mirroring the tree
+  uv run crop.py 'scans/**/*.tif'             # same, via glob
+  uv run crop.py --in-place *.tif            # overwrite originals (backed up)
+  uv run crop.py --suffix _crop *.tif        # write alongside source
+  uv run crop.py --padding 20                # expand crop by 20 px each side
+  uv run crop.py --output-format jpg         # save crops as JPEG
+  uv run crop.py --bbox-only                 # print bboxes only, write nothing
+  uv run crop.py --from-log                  # re-apply crops from log (no API call)
+  uv run crop.py --workers 4                 # parallel processing
+  uv run crop.py --prompt my_prompt.txt      # custom prompt file
+  uv run crop.py --preview-only              # generate previews only
+  uv run crop.py --dry-run                   # previews + no crop/API call
 
-Requires: tifffile, numpy, Pillow, openai
-  pip install tifffile numpy Pillow openai
+Set LMSTUDIO_API_KEY if the model server requires an API key.
+
+Dependencies are declared in pyproject.toml; `uv run` resolves them automatically.
+Without uv: pip install tifffile numpy Pillow openai
+
+If the model returns garbage or truncated responses, suspect the server's inference
+backend before the prompt — see "Model runner backend" in README.md.
 """
 
 import argparse
@@ -57,10 +66,13 @@ from PIL import Image, ImageDraw
 # ---------------------------------------------------------------------------
 
 # using Lemonade Studio
+# LMSTUDIO_* names are kept for compatibility: the env var is the documented
+# knob and renaming it would break existing invocations.
 LMSTUDIO_BASE_URL = "http://localhost:13305/v1"
 LMSTUDIO_API_KEY = getenv('LMSTUDIO_API_KEY') or "lmstudio"
 #DEFAULT_MODEL = "qwen3-vl-8b-instruct"
-DEFAULT_MODEL = "Qwen3.6-35B-A3B-GGUF"
+DEFAULT_MODEL = "Qwen3-VL-8B-Instruct-GGUF-Q8_0"
+#DEFAULT_MODEL = "Qwen3.8-27B-GGUF-UD-Q8_K_XL"
 QWEN_COORD_SIZE = 1000          # model reports boxes in 1000×1000 space
 PREVIEW_MAX_PX = 1000           # longest side of the generated PNG preview
 DEFAULT_RETRIES = 2
@@ -197,7 +209,7 @@ def crop_and_save_image(read_path: Path, output_path: Path,
 
 
 # ---------------------------------------------------------------------------
-# LMStudio / model interaction
+# Model server interaction
 # ---------------------------------------------------------------------------
 
 
@@ -226,7 +238,17 @@ def call_model(client: OpenAI, model: str,
         max_tokens=256,
         temperature=0.0,
     )
-    return response.choices[0].message.content.strip()
+    choice = response.choices[0]
+    text = (choice.message.content or "").strip()
+    if choice.finish_reason != "stop":
+        # A truncated or degenerate completion is not a parse failure — say so,
+        # otherwise a broken backend looks like a bad prompt.  (Repeated "?" with
+        # finish_reason="length" means the server is emitting garbage logits;
+        # check the llama.cpp backend, e.g. rocm vs vulkan.)
+        raise ValueError(
+            f"Model did not finish cleanly (finish_reason={choice.finish_reason!r}, "
+            f"{response.usage.completion_tokens} tokens): {text[:80]!r}")
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -322,14 +344,22 @@ _FMT_EXT = {"tif": ".tif", "tiff": ".tiff",
              "png": ".png", "jpg": ".jpg", "jpeg": ".jpg"}
 
 
-def compute_output_path(src_path: Path, args, output_dir: Path) -> Path:
+def compute_output_path(src_path: Path, args, output_dir: Path,
+                        rel: Path | None = None) -> Path:
     """
     Return the destination path for a crop, based on the active output mode.
 
     Modes (mutually exclusive via CLI validation):
       --in-place  →  same path as source (same extension)
       --suffix S  →  <src_dir>/<stem><S><ext>
-      default     →  <output_dir>/<stem><ext>
+      default     →  <output_dir>/<rel_dir>/<stem><ext>
+
+    *rel* is the source's path relative to --input-dir; its directory part is
+    mirrored under output_dir so a recursive run keeps its tree structure.
+    Defaults to a bare filename, i.e. the flat layout.
+
+    The --suffix and --in-place modes write next to the source, so they
+    preserve the input structure inherently and ignore *rel*.
 
     If --output-format is set, the extension (and thus format) is overridden,
     except when --in-place is active (format conversion in-place is disallowed).
@@ -340,7 +370,8 @@ def compute_output_path(src_path: Path, args, output_dir: Path) -> Path:
         return src_path
     if args.suffix:
         return src_path.parent / f"{src_path.stem}{args.suffix}{ext}"
-    return output_dir / f"{src_path.stem}{ext}"
+    rel = rel or Path(src_path.name)
+    return output_dir / rel.parent / f"{rel.stem}{ext}"
 
 
 def backup_original(path: Path) -> Path:
@@ -399,33 +430,62 @@ def build_log_cache(log_path: Path) -> dict[str, list[int]]:
 # ---------------------------------------------------------------------------
 
 
-def collect_image_paths(inputs: list[str], output_dir: Path | None,
-                        exclude_suffix: str | None = None) -> list[Path]:
+def is_under(path: Path, parent: Path) -> bool:
+    """True if *path* is *parent* or lives anywhere beneath it. Both resolved."""
+    return path == parent or parent in path.parents
+
+
+def relative_key(src_path: Path, input_dir: Path) -> Path:
+    """
+    Path of *src_path* relative to *input_dir*, used to mirror the input tree
+    into the output and preview directories and to key the log.
+
+    Files outside *input_dir* (explicit arguments, globs pointing elsewhere)
+    have no meaningful relative position, so they fall back to a bare filename
+    and land flat in the output directory, as they did before recursion existed.
+    """
+    try:
+        return src_path.relative_to(input_dir)
+    except ValueError:
+        return Path(src_path.name)
+
+
+def collect_image_paths(inputs: list[str],
+                        exclude_dirs: tuple[Path, ...] = (),
+                        exclude_suffix: str | None = None,
+                        recursive: bool = False) -> list[Path]:
     """
     Resolve a mixed list of files, directories, and glob patterns into a
     deduplicated, sorted list of image paths.
 
     Each item is tried in order:
-      1. Existing directory → all image files directly inside it
+      1. Existing directory → image files inside it; one level deep, or the
+                              whole subtree when *recursive*
       2. Existing file      → use directly (if a supported image format)
       3. Otherwise          → treat as a shell glob pattern (** supported)
+
+    Anything inside *exclude_dirs* is dropped, which is what keeps a recursive
+    run from re-ingesting its own output/ and previews/ subdirectories.
     """
     seen: set[Path] = set()
     paths: list[Path] = []
+    excluded = tuple(d.resolve() for d in exclude_dirs if d)
 
     for item in inputs:
         p = Path(item)
 
         if p.is_dir():
+            walk = p.rglob("*") if recursive else p.iterdir()
             candidates = sorted(
-                c for c in p.iterdir()
+                c for c in walk
                 if c.is_file() and c.suffix.lower() in IMAGE_EXTS
             )
         elif p.exists():
             candidates = [p]
         else:
             expanded = [Path(g) for g in sorted(_glob.glob(item, recursive=True))]
-            candidates = [g for g in expanded if g.suffix.lower() in IMAGE_EXTS]
+            candidates = [g for g in expanded
+                          if g.is_file() and g.suffix.lower() in IMAGE_EXTS]
             if not candidates:
                 print(f"WARNING: no image files matched: {item!r}", file=sys.stderr)
                 continue
@@ -434,9 +494,12 @@ def collect_image_paths(inputs: list[str], output_dir: Path | None,
             c = c.resolve()
             if c.suffix.lower() not in IMAGE_EXTS:
                 continue
-            if output_dir and c.parent == output_dir:
+            if any(is_under(c, d) for d in excluded):
                 continue
             if exclude_suffix and c.stem.endswith(exclude_suffix):
+                continue
+            # Never re-crop an --in-place backup (foo.orig.tif).
+            if c.stem.endswith(".orig"):
                 continue
             if c not in seen:
                 seen.add(c)
@@ -469,6 +532,7 @@ def process_image(
     retries: int,
     bbox_only: bool,
     cached_bbox: list[int] | None,
+    rel: Path | None = None,
 ) -> dict:
     """
     Full pipeline for one image.  Returns a log entry dict.
@@ -476,17 +540,20 @@ def process_image(
     If *cached_bbox* is provided (from --from-log), the model API call is
     skipped and the cached bbox_orig is used directly.
     """
-    stem = src_path.stem
-    preview_path = preview_dir / f"{stem}.png"
-    annotated_path = preview_dir / f"{stem}_bbox.png"
+    rel = rel or Path(src_path.name)
+    # Mirror the input tree into previews/ too, otherwise two subdirectories
+    # holding the same filename overwrite each other's previews.
+    preview_path = preview_dir / rel.parent / f"{rel.stem}.png"
+    annotated_path = preview_dir / rel.parent / f"{rel.stem}_bbox.png"
+    key = str(rel)
 
     print(f"\n{'='*60}")
-    print(f"Processing: {src_path.name}")
+    print(f"Processing: {key}")
 
     # --- Skip check ---
     if not force and already_processed(src_path, output_path, in_place):
         print("  Skipping (already processed). Use --force to reprocess.")
-        return {"file": src_path.name, "status": "skipped"}
+        return {"file": key, "status": "skipped"}
 
     # --- Step 1: Generate preview ---
     print("  Generating preview PNG…")
@@ -494,7 +561,7 @@ def process_image(
 
     if dry_run:
         print("  [dry-run] Stopping before model call.")
-        return {"file": src_path.name, "status": "dry-run",
+        return {"file": key, "status": "dry-run",
                 "original_size": [orig_w, orig_h]}
 
     # --- Step 2: Determine bbox ---
@@ -509,7 +576,7 @@ def process_image(
         print(f"  Using cached bbox: {bbox_orig}")
     else:
         # Call model with retries
-        print(f"  Calling {model} via LMStudio…")
+        print(f"  Calling {model}…")
         last_exc: Exception | None = None
         raw_response = ""
         bbox_1000 = None
@@ -551,7 +618,7 @@ def process_image(
     if bbox_only:
         print(f"  [bbox-only] not writing output.")
         return {
-            "file": src_path.name,
+            "file": key,
             "status": "bbox-only",
             "original_size": [orig_w, orig_h],
             "bbox_1000": list(bbox_1000) if bbox_1000 else None,
@@ -572,7 +639,7 @@ def process_image(
     crop_and_save_image(read_path, output_path, bbox_orig, fmt)
 
     return {
-        "file": src_path.name,
+        "file": key,
         "status": "ok",
         "original_size": [orig_w, orig_h],
         "bbox_1000": list(bbox_1000) if bbox_1000 else None,
@@ -590,7 +657,7 @@ def process_image(
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Crop scanned photos using a VLM via LMStudio.",
+        description="Crop scanned photos using a local vision-language model.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -641,14 +708,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     # --- Model ---
     p.add_argument("--model", default=DEFAULT_MODEL,
-                   help=f"LMStudio model name (default: {DEFAULT_MODEL})")
+                   help=f"Model id, exactly as the server reports it "
+                        f"(default: {DEFAULT_MODEL})")
     p.add_argument("--base-url", default=LMSTUDIO_BASE_URL,
-                   help=f"LMStudio base URL (default: {LMSTUDIO_BASE_URL})")
+                   help=f"OpenAI-compatible API base URL "
+                        f"(default: {LMSTUDIO_BASE_URL})")
     p.add_argument("--prompt", type=Path, metavar="FILE",
                    help="Path to a plain-text file whose contents replace the default "
                         "user prompt sent to the model")
     p.add_argument("--retries", type=int, default=DEFAULT_RETRIES,
-                   help=f"How many times to retry the model on parse failure "
+                   help=f"How many times to retry on an unusable model response "
                         f"(default: {DEFAULT_RETRIES})")
 
     # --- Execution modes ---
@@ -660,6 +729,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Print detected bboxes to stdout; do not write any output files")
     p.add_argument("--from-log", action="store_true",
                    help="Re-apply crops using bboxes from crop_log.json; skip model call")
+    p.add_argument("--recursive", "-r", action="store_true",
+                   help="Recurse into subdirectories of a directory input. "
+                        "Output and preview trees mirror the input structure. "
+                        "(Glob patterns with ** already recurse.)")
     p.add_argument("--force", action="store_true",
                    help="Reprocess files even if output already exists")
     p.add_argument("--workers", type=int, default=1, metavar="N",
@@ -695,8 +768,12 @@ def main() -> None:
 
     # --- Collect images ---
     inputs = args.files if args.files else [str(input_dir)]
-    image_paths = collect_image_paths(inputs, output_dir,
-                                      exclude_suffix=args.suffix)
+    image_paths = collect_image_paths(
+        inputs,
+        exclude_dirs=(output_dir, preview_dir),
+        exclude_suffix=args.suffix,
+        recursive=args.recursive,
+    )
 
     if not image_paths:
         print("No image files found.")
@@ -707,8 +784,9 @@ def main() -> None:
     # --- Preview-only short circuit ---
     if args.preview_only:
         for src_path in image_paths:
-            preview_path = preview_dir / f"{src_path.stem}.png"
-            print(f"\nGenerating preview: {src_path.name}")
+            rel = relative_key(src_path, input_dir)
+            preview_path = preview_dir / rel.parent / f"{rel.stem}.png"
+            print(f"\nGenerating preview: {rel}")
             generate_preview(src_path, preview_path)
         return
 
@@ -722,7 +800,7 @@ def main() -> None:
         else:
             print(f"Loaded {len(log_bbox_cache)} cached bbox(es) from log.")
 
-    # --- LMStudio client (skipped when every file will use cached bboxes) ---
+    # --- Model client (skipped when every file will use cached bboxes) ---
     client: OpenAI | None = None
     if not args.from_log and not args.dry_run and not args.bbox_only:
         client = OpenAI(base_url=args.base_url, api_key=LMSTUDIO_API_KEY)
@@ -735,14 +813,15 @@ def main() -> None:
     results: list[dict] = []
 
     def _process_one(src_path: Path) -> dict:
-        output_path = compute_output_path(src_path, args, output_dir)
-        cached_bbox = log_bbox_cache.get(src_path.name) if args.from_log else None
+        rel = relative_key(src_path, input_dir)
+        output_path = compute_output_path(src_path, args, output_dir, rel)
+        cached_bbox = log_bbox_cache.get(str(rel)) if args.from_log else None
 
         if args.from_log and cached_bbox is None:
             print(f"\n{'='*60}")
-            print(f"Processing: {src_path.name}")
+            print(f"Processing: {rel}")
             print("  WARNING: no cached bbox in log — skipping.", file=sys.stderr)
-            return {"file": src_path.name, "status": "skipped",
+            return {"file": str(rel), "status": "skipped",
                     "reason": "no cached bbox in log"}
 
         return process_image(
@@ -763,6 +842,7 @@ def main() -> None:
             retries=args.retries,
             bbox_only=args.bbox_only,
             cached_bbox=cached_bbox,
+            rel=rel,
         )
 
     def _record(result: dict) -> None:
@@ -779,15 +859,17 @@ def main() -> None:
                     _record(fut.result())
                 except Exception as exc:
                     src = futures[fut]
-                    print(f"  ERROR ({src.name}): {exc}", file=sys.stderr)
-                    _record({"file": src.name, "status": "error", "error": str(exc)})
+                    key = str(relative_key(src, input_dir))
+                    print(f"  ERROR ({key}): {exc}", file=sys.stderr)
+                    _record({"file": key, "status": "error", "error": str(exc)})
     else:
         for src_path in image_paths:
             try:
                 _record(_process_one(src_path))
             except Exception as exc:
                 print(f"  ERROR: {exc}", file=sys.stderr)
-                _record({"file": src_path.name, "status": "error", "error": str(exc)})
+                _record({"file": str(relative_key(src_path, input_dir)),
+                         "status": "error", "error": str(exc)})
 
     # --- Summary ---
     print(f"\n{'='*60}")
